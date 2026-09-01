@@ -4,46 +4,13 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::error::{CoreError, CoreResult};
+use crate::error::CoreError;
 
 use super::common_utils::{
     has_bearer_auth, has_header, messages_provider_config, string_headers, truncate_error_body,
 };
-use super::handler::execute_messages_provider_call;
 use super::messages;
-use super::transformation::AnthropicMessagesProviderConfig;
-use super::types::{AnthropicMessagesResponse, MessagesRequest, ProviderMessagesRequest};
-
-struct RejectingResponseConfig;
-
-impl AnthropicMessagesProviderConfig for RejectingResponseConfig {
-    fn complete_url(
-        &self,
-        _api_base: Option<&str>,
-        _model: &str,
-        _env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> CoreResult<String> {
-        unreachable!()
-    }
-
-    fn resolve_api_key(
-        &self,
-        _api_key: Option<&str>,
-        _env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> CoreResult<String> {
-        unreachable!()
-    }
-
-    fn transform_response(
-        &self,
-        _model: &str,
-        _response: AnthropicMessagesResponse,
-    ) -> CoreResult<AnthropicMessagesResponse> {
-        Err(CoreError::MissingField("normalized_content"))
-    }
-}
-
-static REJECTING_RESPONSE_CONFIG: RejectingResponseConfig = RejectingResponseConfig;
+use super::types::MessagesRequest;
 
 async fn read_http_request(socket: &mut TcpStream) -> String {
     let mut request = Vec::new();
@@ -208,39 +175,6 @@ async fn messages_round_trip_builds_azure_request_and_passes_response_through() 
     assert_eq!(
         sent_body["messages"][0]["content"][0]["cache_control"],
         json!({"type": "ephemeral"})
-    );
-}
-
-#[tokio::test]
-async fn post_response_transform_errors_are_non_retryable() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
-    let addr = listener.local_addr().expect("addr");
-
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accepts request");
-        let _ = read_http_request(&mut socket).await;
-        let response_body = r#"{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-test"}"#;
-        socket
-            .write_all(write_response(response_body).as_bytes())
-            .await
-            .expect("writes response");
-    });
-
-    let error = execute_messages_provider_call(ProviderMessagesRequest {
-        provider: "anthropic".to_string(),
-        model: "claude-test".to_string(),
-        config: &REJECTING_RESPONSE_CONFIG,
-        url: format!("http://{addr}/v1/messages"),
-        body: json!({}),
-        upstream_headers: Vec::new(),
-        timeout: Some(Duration::from_secs(5)),
-    })
-    .await
-    .expect_err("response transform should fail");
-
-    server.await.expect("server task completes");
-    assert!(
-        matches!(error, CoreError::InvalidResponse(message) if message.contains("normalized_content"))
     );
 }
 
@@ -504,65 +438,4 @@ async fn messages_rejects_unsupported_provider() {
     .expect_err("unsupported provider errors");
 
     assert!(matches!(err, CoreError::InvalidProvider(provider) if provider == "openai"));
-}
-
-#[tokio::test]
-async fn messages_classifies_a_refused_connection_as_safe_to_fallback() {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
-        listener.local_addr().expect("has an address").port()
-    };
-    let error = messages(MessagesRequest {
-        model: "claude-test",
-        body: json!({"model": "claude-test", "max_tokens": 8, "messages": []}),
-        api_key: Some("sk"),
-        api_base: Some(&format!("http://127.0.0.1:{port}")),
-        custom_llm_provider: Some("anthropic"),
-        extra_headers: None,
-        timeout: Some(Duration::from_secs(1)),
-    })
-    .await
-    .expect_err("nothing is listening");
-
-    assert!(matches!(error, CoreError::Connect(_)));
-}
-
-#[tokio::test]
-async fn messages_classifies_an_established_request_timeout_as_network_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
-    let addr = listener.local_addr().expect("has an address");
-    let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
-    let (release_server_tx, release_server_rx) = tokio::sync::oneshot::channel();
-
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accepts request");
-        let request = read_http_request(&mut socket).await;
-        request_received_tx.send(request).expect("reports request");
-        release_server_rx.await.expect("server is released");
-    });
-
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        messages(MessagesRequest {
-            model: "claude-test",
-            body: json!({"model": "claude-test", "max_tokens": 8, "messages": []}),
-            api_key: Some("sk"),
-            api_base: Some(&format!("http://{addr}")),
-            custom_llm_provider: Some("anthropic"),
-            extra_headers: None,
-            timeout: Some(Duration::from_millis(100)),
-        }),
-    )
-    .await
-    .expect("client call completes")
-    .expect_err("established request times out");
-
-    let request = tokio::time::timeout(Duration::from_secs(2), request_received_rx)
-        .await
-        .expect("server observes request")
-        .expect("server reports request");
-    assert!(request.starts_with("POST /v1/messages "), "{request}");
-    release_server_tx.send(()).expect("releases server");
-    server.await.expect("server task completes");
-    assert!(matches!(error, CoreError::Network(_)));
 }

@@ -56,3 +56,34 @@ pub fn json_type_name(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Object(_) => "object",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_errors_collapse_to_one_non_retryable_variant() {
+        for original in [
+            CoreError::MissingField("usage"),
+            CoreError::Unsupported("non-text response content block"),
+            CoreError::InvalidRequest("whatever".to_string()),
+            CoreError::Auth("whatever".to_string()),
+        ] {
+            assert!(matches!(
+                as_response_error(original),
+                CoreError::InvalidResponse(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn response_errors_preserve_an_upstream_status() {
+        assert!(matches!(
+            as_response_error(CoreError::Http {
+                status: 500,
+                body: "boom".to_string()
+            }),
+            CoreError::Http { status: 500, .. }
+        ));
+    }
+}
